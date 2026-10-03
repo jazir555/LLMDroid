@@ -279,6 +279,16 @@ async function connect() {
     $('state').textContent = 'connected'; rxBuf = new Uint8Array(0);
     log(`connected to ${url} (cap ${store.cap} keys/layer)`);
     holdWakeLock();
+    // App-level heartbeat: proves this tab's JS runs. The bridge's liveness
+    // verdict ignores WS pongs (backgrounded tabs pong but never run JS);
+    // without these, a throttled tab looks identical to a live one and can
+    // squat the slot while the foreground tab knocks.
+    clearInterval(ws._hbTimer);
+    ws._hbTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.send('hb'); } catch (_) {}
+      }
+    }, 10000);
     refresh();
   };
   // Binary frames are PATN messages; text frames are host notes ("mac PHASE...").
@@ -287,6 +297,7 @@ async function connect() {
     onData(new Uint8Array(ev.data));
   };
   ws.onclose = (ev) => {
+    clearInterval(ws._hbTimer);
     const why = ev.code === 1013 ? ' (bridge held elsewhere — this tab stays standby)' : '';
     $('state').textContent = isLeader ? `closed (${ev.code})` : 'standby';
     log(`closed (${ev.code})${why}; reconnect in 3 s`);

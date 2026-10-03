@@ -67,7 +67,7 @@ class Pipe:
             if self.ws is not None:
                 return False
             self.ws = s
-            self.ws_hb = {"rx": time.time(), "misses": 0, "max": 4}
+            self.ws_hb = {"rx": time.time(), "misses": 0, "max": 4, "app": 0.0, "data": 0.0, "t0": time.time()}
             self.notes_cv.notify_all()
             return True
 
@@ -91,7 +91,7 @@ class Pipe:
                 except OSError:
                     pass
             self.ws = s
-            self.ws_hb = {"rx": time.time(), "misses": 0, "max": 4}
+            self.ws_hb = {"rx": time.time(), "misses": 0, "max": 4, "app": 0.0, "data": 0.0, "t0": time.time()}
             self.notes_cv.notify_all()
             return True
 
@@ -267,14 +267,23 @@ def forward_ws_to_tcp(pipe: Pipe, ws):
         hb = pipe.ws_hb if pipe.ws is ws else {"misses": 0, "max": 4}
     try:
         while True:
-            msg = ws_recv(ws, hb)
+            try:
+                msg = ws_recv(ws, hb)
+            except OSError:
+                break  # reset/abort mid-frame: same as close
             if msg is None:
                 if hb.get("misses", 0) > hb.get("max", 4):
                     print("webgpu-bridge: tab silent through pings, dropping", flush=True)
                 break
             op, payload = msg
             if op == 0x1:
+                # App-level heartbeat ("hb") or stray text: proves the tab's
+                # JS event loop runs (WS pongs don't - the browser answers
+                # those with throttled JS). Drives liveness verdicts.
+                if payload == b"hb":
+                    hb["app"] = time.time()
                 continue  # browser never sends notes; ignore stray text
+            hb["data"] = time.time()
             with pipe.lock:
                 tcp = pipe.tcp
             if tcp is None:
@@ -352,25 +361,26 @@ def bind_listener(listen: str, port: int, taken: set, tries: int = 2000):
 _challenge_cooldown: dict = {}  # ip -> last challenge epoch (anti-hammer)
 
 
-def challenge_holder(pipe: Pipe) -> str:
-    """Ping the slot holder and wait 5 s for any frame (pong counts).
-    Returns 'alive', 'dead', or 'gone' (slot changed under us). A live tab
-    always answers (browsers pong automatically, even backgrounded); only a
-    network-switched ghost stays silent."""
+LIVE_WINDOW = 45.0   # app-hb or data activity this fresh = holder JS runs
+ADOPT_GRACE = 60.0  # holders younger than this are immune to challenges
+
+
+def verdict_holder(pipe: Pipe) -> str:
+    """No-sleep liveness verdict for the slot holder: 'alive', 'dead', or
+    'gone'. Alive means the tab's JS proved itself within LIVE_WINDOW via an
+    app heartbeat or forwarded data (WS pongs deliberately don't count:
+    throttled background tabs pong but never run JS). Fresh adoptions get
+    ADOPT_GRACE to load kernels and start heartbeating."""
     with pipe.lock:
         holder = pipe.ws
         hb = pipe.ws_hb
     if holder is None:
         return "gone"
-    mark = hb.get("rx", 0)
-    if not ws_send(holder, 0x9, b"ch"):
-        return "dead"
-    time.sleep(5)
-    with pipe.lock:
-        if pipe.ws is not holder:
-            return "gone"
-        if hb.get("rx", 0) > mark:
-            return "alive"
+    now = time.time()
+    if now - hb.get("t0", now) < ADOPT_GRACE:
+        return "alive"
+    if now - max(hb.get("app", 0), hb.get("data", 0)) < LIVE_WINDOW:
+        return "alive"
     return "dead"
 
 
@@ -400,11 +410,11 @@ def serve_ws(pipe: Pipe, srv, p: int, listen: str, token: str):
             continue
         if not pipe.try_adopt(s):
             ip = addr[0]
-            # Slot taken. Usually a second tab — but a phone that hops Wi-Fi
-            # leaves a ghost holding the slot while its replacement knocks.
-            # Challenge (unless this IP was challenged <30 s ago, anti-hammer):
-            # a live holder pongs and the newcomer is refused; a silent ghost
-            # is evicted and the newcomer takes the slot.
+            # Slot taken. Usually a second tab — but a backgrounded/throttled
+            # tab (or a network-switched ghost) can squat it while the live
+            # one knocks. Verdict is instant (no sleep): a holder whose JS
+            # proved itself within LIVE_WINDOW keeps the slot; a silent one
+            # is evicted. Same-IP rechallenges are rate-limited (anti-hammer).
             now = time.time()
             if now - _challenge_cooldown.get(ip, 0) < 30:
                 print(f"webgpu-bridge: extra tab from {ip} rejected (one at a time)", flush=True)
@@ -420,14 +430,14 @@ def serve_ws(pipe: Pipe, srv, p: int, listen: str, token: str):
                 else:
                     reject_ws(s, ip)  # lost a race; newcomer retries
                 continue
-            print(f"webgpu-bridge: slot held, challenging for {ip}…", flush=True)
-            verdict = challenge_holder(pipe)
+            verdict = verdict_holder(pipe)
             if verdict == "alive":
-                print(f"webgpu-bridge: holder alive, {ip} rejected (one at a time)", flush=True)
+                print(f"webgpu-bridge: holder live, {ip} rejected (one at a time)", flush=True)
                 reject_ws(s, ip)
                 continue
             if pipe.steal_ws(holder, s):
-                print(f"webgpu-bridge: ghost evicted, tab connected ({ip})", flush=True)
+                why = "slot free" if verdict == "gone" else "stale holder evicted"
+                print(f"webgpu-bridge: {why}, tab connected ({ip})", flush=True)
                 threading.Thread(target=forward_ws_to_tcp, args=(pipe, s), daemon=True).start()
             continue
         print(f"webgpu-bridge: tab connected ({addr[0]})", flush=True)
