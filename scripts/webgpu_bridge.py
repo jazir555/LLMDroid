@@ -277,11 +277,18 @@ def forward_ws_to_tcp(pipe: Pipe, ws):
                 break
             op, payload = msg
             if op == 0x1:
-                # App-level heartbeat ("hb") or stray text: proves the tab's
-                # JS event loop runs (WS pongs don't - the browser answers
-                # those with throttled JS). Drives liveness verdicts.
+                # App-level heartbeat ("hb") or remote log ("log ..."): both
+                # prove the tab's JS event loop runs (WS pongs don't - the
+                # browser answers those with throttled JS). hb drives the
+                # liveness verdicts; log lines go to the operator console.
                 if payload == b"hb":
                     hb["app"] = time.time()
+                elif payload.startswith(b"log "):
+                    try:
+                        peer = ws.getpeername()[0]
+                    except OSError:
+                        peer = "?"
+                    print(f"[tab {peer}] {payload[4:160].decode('utf8', 'replace')}", flush=True)
                 continue  # browser never sends notes; ignore stray text
             hb["data"] = time.time()
             with pipe.lock:

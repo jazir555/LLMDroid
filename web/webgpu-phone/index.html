@@ -53,6 +53,23 @@
   <div class="sub">kernels: <span id="kernels">not loaded</span></div>
 
   <div id="log" aria-label="Log"></div>
+  <script>
+    // Boot-error trap: if the module below (or unpkg) fails, the page would
+    // otherwise sit blank with no clue. Surface it in the log box instead.
+    window.__bootErrors = [];
+    window.addEventListener('error', function (e) {
+      var msg = 'boot: ' + (e.message || e.type) + ' @ ' + (e.filename || '').split('/').pop();
+      window.__bootErrors.push(msg);
+      var el = document.getElementById('log');
+      if (el) el.textContent = msg + '\n' + el.textContent;
+    }, true);
+    window.addEventListener('unhandledrejection', function (e) {
+      var msg = 'boot: unhandled ' + ((e.reason && e.reason.message) || e.reason);
+      window.__bootErrors.push(msg);
+      var el = document.getElementById('log');
+      if (el) el.textContent = msg + '\n' + el.textContent;
+    }, true);
+  </script>
   <p class="sub">Keep this tab open (the host carries on alone if it disconnects). Serve the page over
   <code>http://localhost</code> (secure context for WebGPU), e.g.
   <code>python -m http.server 8000 --directory web/webgpu-phone</code>. See
@@ -60,6 +77,6 @@
 </main>
 <!-- ?v= cache-bust: phones aggressively cache app.js (304s), which once
      stranded a tester on a pre-election build. Bump on each JS change. -->
-<script type="module" src="./app.js?v=4"></script>
+<script type="module" src="./app.js?v=5"></script>
 </body>
 </html>

@@ -18,6 +18,7 @@ export function log(s) {
   const el = logEl();
   const line = `${new Date().toLocaleTimeString()} ${s}`;
   el.textContent = (line + '\n' + el.textContent).slice(0, 8000);
+  remoteLog(line);
 }
 
 // ?cap=N overrides the keys/layer cap (default 8192, clamp 1024..65536).
@@ -61,6 +62,22 @@ function refresh() {
 
 function send(bytes) {
   ws.send(bytes);
+}
+
+/* Remote logging: mirror notable lines to the bridge operator (text frame
+ * "log <line>", printed as [tab ip] by the bridge). Best-effort, capped. */
+let _logBurst = 0;
+let _logWindow = 0;
+function remoteLog(s) {
+  try {
+    const now = Date.now();
+    if (now - _logWindow > 5000) { _logWindow = now; _logBurst = 0; }
+    if (_logBurst >= 20) return;
+    _logBurst++;
+    if (ws && ws.readyState === WebSocket.OPEN && s.length < 300) {
+      ws.send('log ' + s);
+    }
+  } catch (_) {}
 }
 
 async function handleMessage(type, payload) {
