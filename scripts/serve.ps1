@@ -28,6 +28,7 @@ param(
   [string]$Bin = "",
   [switch]$NoPhone,
   [switch]$NoProxy,
+  [switch]$Webgpu,   # wireless WebGPU tab via phone_up_webgpu.py (no adb, no split tail)
   [string]$CacheDir = "",
   [string]$ServerArgs = ""
 )
@@ -57,10 +58,41 @@ if (-not (Test-Path $ServerExe)) { $ServerExe = Join-Path $Bin 'llama-server' }
 if (-not (Test-Path $ServerExe)) { throw "llama-server not found in $Bin (build llama.cpp for Windows first; see docs/ANDROID.md)" }
 if (-not (Test-Path $Model)) { throw "missing model: $Model" }
 
-# --- phone auto-detect (Android over adb reverse; explicit env wins) ---
+# --- phone auto-detect (Android over adb reverse, or wireless WebGPU tab; explicit env wins) ---
 $PhoneIp = ''
 $CtxTotal = $env:CTX_TOTAL
-if (-not $NoPhone -and -not $PhoneKv -and -not $SplitTail -and ($env:PHONE ?? 'auto') -ne '0') {
+if ($Webgpu -or ($env:WEBGPU ?? '0') -eq '1') {
+  # Wireless node: bridge TCP port may have floated past Hyper-V exclusions;
+  # the bridge prints `ports tcp=X ...`; match it via WEBGPU_TCP_PORT/CMD_PORT.
+  $wh = if ($env:WEBGPU_HOST) { $env:WEBGPU_HOST } else { '127.0.0.1' }
+  $wtcp = if ($env:WEBGPU_TCP_PORT) { $env:WEBGPU_TCP_PORT } else { '50062' }
+  $wcmd = if ($env:WEBGPU_CMD_PORT) { $env:WEBGPU_CMD_PORT } else { '50061' }
+  try {
+    $line = & python "$Scripts\phone_up_webgpu.py" --host $wh --tcp-port $wtcp --cmd-port $wcmd 2> (Join-Path ([IO.Path]::GetTempPath()) 'phone-up-webgpu.log') | Select-Object -Last 1
+    if ($line -match '^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*(.*)$') {
+      $pip, $pver, $pavail, $pwired = $Matches[1], $Matches[3], [int]$Matches[4], [int]$Matches[5]
+      $PhoneIp = $pip
+      $wiredMax = if ($env:PHONE_WIRED_MAX_MB) { [int]$env:PHONE_WIRED_MAX_MB } else { 9400 }
+      $appReserve = if ($env:PHONE_APP_RESERVE_MB) { [int]$env:PHONE_APP_RESERVE_MB } else { 512 }
+      if ($pwired -le 0 -or $pavail -le $appReserve) {
+        Write-Warning 'serve: wireless tab memory unknown or too low; remote KV disabled'
+      } else {
+        $PhoneKv = "$pip`:$wtcp"   # never a split tail wirelessly (TAIL 0)
+        $bpt = switch ($Kv) { 'q4_0' { 18432 } 'f16' { 65536 } default { 34816 } }
+        $capA = $Ctx + [int](($pavail - $appReserve) * 1048576 / $bpt / 4096) * 4096
+        $cap = [Math]::Min($capA, 262144)
+        if ($CtxTotal -and [int]$CtxTotal -gt $cap) { throw "serve: requested CTX_TOTAL=$CtxTotal exceeds wireless tab safe $Kv cap $cap" }
+        if (-not $CtxTotal) { $CtxTotal = "$cap" }
+      }
+      Write-Warning "serve: webgpu-wireless at $pip`:$wtcp : split prefill off; context up to $($CtxTotal ?? $Ctx) tokens (remote KV $(if ($PhoneKv) {'on'} else {'off'}), v$pver)"
+    } else {
+      Write-Warning 'serve: no wireless tab: Windows alone (start webgpu_bridge.py + connect the tab)'
+    }
+  } catch {
+    Write-Warning "serve: no wireless tab: Windows alone ($($_.Exception.Message))"
+  }
+}
+elseif (-not $NoPhone -and -not $PhoneKv -and -not $SplitTail -and ($env:PHONE ?? 'auto') -ne '0') {
   try {
     $line = & python "$Scripts\phone_up_android.py" 2> (Join-Path ([IO.Path]::GetTempPath()) 'phone-up-android.log') | Select-Object -Last 1
     if ($line -match '^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s*(.*)$') {

@@ -32,6 +32,7 @@ import secrets
 import socket
 import struct
 import threading
+import time
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 PATN_HELLO = struct.pack("<IIQ", 0x4E544150, 1, 0)
@@ -45,6 +46,7 @@ class Pipe:
         self.lock = threading.Lock()
         self.tcp = None       # socket to llama host
         self.ws = None        # socket to browser
+        self.ws_hb = {}       # heartbeat bookkeeping for the holder (see ws_recv)
         self.notes = []       # pending text notes for the browser
         self.notes_cv = threading.Condition(self.lock)
 
@@ -59,15 +61,37 @@ class Pipe:
             self.tcp = s
             return True
 
-    def set_ws(self, s):
+    def try_adopt(self, s):
+        """Adopt s as the tab iff the slot is free. Never closes s."""
         with self.lock:
             if self.ws is not None:
+                return False
+            self.ws = s
+            self.ws_hb = {"rx": time.time(), "misses": 0, "max": 4}
+            self.notes_cv.notify_all()
+            return True
+
+    def steal_ws(self, holder, s):
+        """Install s, evicting holder if it still holds the slot.
+        Returns True if s is now the tab."""
+        with self.lock:
+            if self.ws is not None and self.ws is not holder:
                 try:
                     s.close()
                 except OSError:
                     pass
                 return False
+            if self.ws is holder:
+                try:
+                    holder.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
+                    holder.close()
+                except OSError:
+                    pass
             self.ws = s
+            self.ws_hb = {"rx": time.time(), "misses": 0, "max": 4}
             self.notes_cv.notify_all()
             return True
 
@@ -77,6 +101,7 @@ class Pipe:
                 self.tcp = None
             if self.ws is s:
                 self.ws = None
+                self.ws_hb = {}
 
 
 # ---------------- minimal WebSocket server (RFC 6455, stdlib) ----------------
@@ -120,16 +145,35 @@ def ws_accept(s, token: str) -> bool:
     return True
 
 
-def ws_recv(s) -> tuple[int, bytes] | None:
-    """One reassembled message. Returns (opcode, payload) or None on close."""
+def ws_recv(s, hb: dict | None = None) -> tuple[int, bytes] | None:
+    """One reassembled message. Returns (opcode, payload) or None on close.
+
+    With hb={"misses": 0, "max": 4, "interval": 45} (set by the holder path
+    with a matching socket timeout), silence is probed with WS pings: any
+    frame — even a pong — resets the count. A peer that switched networks
+    answers neither and is dropped after max misses, freeing the one-tab
+    slot for its replacement. Idle-but-alive tabs answer pings, so normal
+    standby between host calls is unaffected.
+    """
     chunks, op = [], None
     while True:
-        hdr = b""
-        while len(hdr) < 2:
-            c = s.recv(2 - len(hdr))
-            if not c:
+        try:
+            hdr = b""
+            while len(hdr) < 2:
+                c = s.recv(2 - len(hdr))
+                if not c:
+                    return None
+                hdr += c
+        except socket.timeout:
+            if hb is None:
+                continue
+            hb["misses"] = hb.get("misses", 0) + 1
+            if hb["misses"] > hb.get("max", 4):
                 return None
-            hdr += c
+            ws_send(s, 0x9, b"hb")  # browsers answer even backgrounded
+            continue
+        if hb is not None:
+            hb["misses"] = 0
         fin = hdr[0] & 0x80
         cur = hdr[0] & 0x0F
         masked = hdr[1] & 0x80
@@ -156,6 +200,8 @@ def ws_recv(s) -> tuple[int, bytes] | None:
             payload += c
         if masked:
             payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        if hb is not None:
+            hb["rx"] = time.time()  # any frame (even pong) proves liveness
         if cur == 0x8:
             return None
         if cur == 0x9:  # ping -> pong
@@ -194,20 +240,37 @@ def ws_send(s, opcode: int, payload: bytes) -> bool:
 
 # ---------------- bridge ----------------
 
-def tune(s):
+def tune(s, keepalive=True):
     try:
         s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 << 20)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        if keepalive:
+            # Dead-peer detection: a phone that switches Wi-Fi (or closes its
+            # lid) never FINs, and would otherwise hold the one-tab slot
+            # forever. Probe an idle connection; unanswered probes kill it.
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            if hasattr(socket, "SIO_KEEPALIVE_VALS"):
+                s.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 5000))
+            else:
+                for opt, val in (("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 5),
+                                 ("TCP_KEEPCNT", 3)):
+                    if hasattr(socket, opt):
+                        s.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
     except OSError:
         pass
 
 
 def forward_ws_to_tcp(pipe: Pipe, ws):
+    ws.settimeout(45)  # silence probe cadence; see ws_recv hb
+    with pipe.lock:
+        hb = pipe.ws_hb if pipe.ws is ws else {"misses": 0, "max": 4}
     try:
         while True:
-            msg = ws_recv(ws)
+            msg = ws_recv(ws, hb)
             if msg is None:
+                if hb.get("misses", 0) > hb.get("max", 4):
+                    print("webgpu-bridge: tab silent through pings, dropping", flush=True)
                 break
             op, payload = msg
             if op == 0x1:
@@ -256,14 +319,74 @@ def forward_tcp_to_ws(pipe: Pipe, tcp):
             pass
 
 
-def serve_ws(pipe: Pipe, listen: str, port: int, token: str):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((listen, port))
-    srv.listen(4)
-    print(f"webgpu-bridge: ws on {listen}:{port} (token set)", flush=True)
+def bind_listener(listen: str, port: int, taken: set, tries: int = 2000):
+    """Bind with fallback: Windows Hyper-V reserves ranges like 50060-50159
+    (netsh int ipv4 show excludedportrange), so the default phone ports may
+    refuse with EACCES. Try port..port+tries-1, skipping ports sibling
+    listeners already claimed, and report what stuck."""
+    last = None
+    for p in range(port, port + tries):
+        if p in taken:
+            continue
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind((listen, p))
+        except PermissionError as e:
+            last = e
+            srv.close()
+            continue
+        except OSError as e:
+            last = e
+            srv.close()
+            continue
+        srv.listen(4)
+        taken.add(p)
+        return srv, p
+    raise RuntimeError(
+        f"bind {listen}:{port}..{port + tries - 1} failed ({last}); "
+        "on Windows check Hyper-V exclusions: netsh int ipv4 show excludedportrange protocol=tcp"
+    )
+
+
+_challenge_cooldown: dict = {}  # ip -> last challenge epoch (anti-hammer)
+
+
+def challenge_holder(pipe: Pipe) -> str:
+    """Ping the slot holder and wait 5 s for any frame (pong counts).
+    Returns 'alive', 'dead', or 'gone' (slot changed under us). A live tab
+    always answers (browsers pong automatically, even backgrounded); only a
+    network-switched ghost stays silent."""
+    with pipe.lock:
+        holder = pipe.ws
+        hb = pipe.ws_hb
+    if holder is None:
+        return "gone"
+    mark = hb.get("rx", 0)
+    if not ws_send(holder, 0x9, b"ch"):
+        return "dead"
+    time.sleep(5)
+    with pipe.lock:
+        if pipe.ws is not holder:
+            return "gone"
+        if hb.get("rx", 0) > mark:
+            return "alive"
+    return "dead"
+
+
+def reject_ws(s, ip):
+    ws_send(s, 0x8, struct.pack(">H", 1013) + b"one tab at a time")
+    try:
+        s.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    s.close()
+
+
+def serve_ws(pipe: Pipe, srv, p: int, listen: str, token: str):
+    print(f"webgpu-bridge: ws on {listen}:{p} (token set)", flush=True)
     while True:
-        s, _ = srv.accept()
+        s, addr = srv.accept()
         tune(s)
         try:
             if not ws_accept(s, token):
@@ -275,19 +398,44 @@ def serve_ws(pipe: Pipe, listen: str, port: int, token: str):
             except OSError:
                 pass
             continue
-        if not pipe.set_ws(s):
-            print("webgpu-bridge: extra tab rejected (one at a time)", flush=True)
+        if not pipe.try_adopt(s):
+            ip = addr[0]
+            # Slot taken. Usually a second tab — but a phone that hops Wi-Fi
+            # leaves a ghost holding the slot while its replacement knocks.
+            # Challenge (unless this IP was challenged <30 s ago, anti-hammer):
+            # a live holder pongs and the newcomer is refused; a silent ghost
+            # is evicted and the newcomer takes the slot.
+            now = time.time()
+            if now - _challenge_cooldown.get(ip, 0) < 30:
+                print(f"webgpu-bridge: extra tab from {ip} rejected (one at a time)", flush=True)
+                reject_ws(s, ip)
+                continue
+            _challenge_cooldown[ip] = now
+            with pipe.lock:
+                holder = pipe.ws
+            if holder is None:
+                if pipe.try_adopt(s):
+                    print(f"webgpu-bridge: tab connected ({ip})", flush=True)
+                    threading.Thread(target=forward_ws_to_tcp, args=(pipe, s), daemon=True).start()
+                else:
+                    reject_ws(s, ip)  # lost a race; newcomer retries
+                continue
+            print(f"webgpu-bridge: slot held, challenging for {ip}…", flush=True)
+            verdict = challenge_holder(pipe)
+            if verdict == "alive":
+                print(f"webgpu-bridge: holder alive, {ip} rejected (one at a time)", flush=True)
+                reject_ws(s, ip)
+                continue
+            if pipe.steal_ws(holder, s):
+                print(f"webgpu-bridge: ghost evicted, tab connected ({ip})", flush=True)
+                threading.Thread(target=forward_ws_to_tcp, args=(pipe, s), daemon=True).start()
             continue
-        print("webgpu-bridge: tab connected", flush=True)
+        print(f"webgpu-bridge: tab connected ({addr[0]})", flush=True)
         threading.Thread(target=forward_ws_to_tcp, args=(pipe, s), daemon=True).start()
 
 
-def serve_tcp(pipe: Pipe, listen: str, port: int):
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((listen, port))
-    srv.listen(4)
-    print(f"webgpu-bridge: phone-attn TCP on {listen}:{port}", flush=True)
+def serve_tcp(pipe: Pipe, srv, p: int, listen: str):
+    print(f"webgpu-bridge: phone-attn TCP on {listen}:{p}", flush=True)
     while True:
         s, _ = srv.accept()
         tune(s)
@@ -297,13 +445,9 @@ def serve_tcp(pipe: Pipe, listen: str, port: int):
         threading.Thread(target=forward_tcp_to_ws, args=(pipe, s), daemon=True).start()
 
 
-def serve_cmd(pipe: Pipe, listen: str, port: int):
+def serve_cmd(pipe: Pipe, srv, p: int, listen: str):
     """Local :50061: mem for serve sizing + mac notes for the tab."""
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((listen, port))
-    srv.listen(4)
-    print(f"webgpu-bridge: cmd on {listen}:{port}", flush=True)
+    print(f"webgpu-bridge: cmd on {listen}:{p}", flush=True)
     while True:
         s, _ = srv.accept()
         threading.Thread(target=handle_cmd, args=(pipe, s), daemon=True).start()
@@ -362,13 +506,18 @@ def main():
     if not args.token:
         print(f"webgpu-bridge: generated token: {token}", flush=True)
     pipe = Pipe(args.avail_mb)
-    for target, fn in (("ws", serve_ws), ("tcp", serve_tcp), ("cmd", serve_cmd)):
-        if target == "ws":
-            t = threading.Thread(target=fn, args=(pipe, args.listen, args.ws_port, token), daemon=True)
-        else:
-            port = args.tcp_port if target == "tcp" else args.cmd_port
-            t = threading.Thread(target=fn, args=(pipe, args.listen, port), daemon=True)
-        t.start()
+    # Bind sequentially (not in threads): Windows SO_REUSEADDR permits two
+    # sockets on the same addr:port, so racing binds could all land on one
+    # port and steal each other's accepts. Taken-set keeps them distinct.
+    taken = set()
+    srv_ws, p_ws = bind_listener(args.listen, args.ws_port, taken)
+    srv_tcp, p_tcp = bind_listener(args.listen, args.tcp_port, taken)
+    srv_cmd, p_cmd = bind_listener(args.listen, args.cmd_port, taken)
+    print(f"webgpu-bridge: ports tcp={p_tcp} ws={p_ws} cmd={p_cmd}", flush=True)
+    for fn, fnargs in ((serve_ws, (pipe, srv_ws, p_ws, args.listen, token)),
+                       (serve_tcp, (pipe, srv_tcp, p_tcp, args.listen)),
+                       (serve_cmd, (pipe, srv_cmd, p_cmd, args.listen))):
+        threading.Thread(target=fn, args=fnargs, daemon=True).start()
     print("webgpu-bridge: serving (Ctrl-C to stop)", flush=True)
     try:
         threading.Event().wait()

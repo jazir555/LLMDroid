@@ -188,6 +188,10 @@ bench/long-bench.py                    # past 64k (long: cold reads to 128k)
 
 Pre-release. Next: the phone's layers seeing the keys it holds (split prefill past 64k), a second phone in the prefill chain,
 an App Store build, and upstreaming what makes sense to llama.cpp.
+
+Ports that work without hardware: Android app scaffold (CPU path; Vulkan/NNAPI engines stubbed),
+Windows host scripts (`scripts/serve.ps1`, `phone_up_android.py`), and the wireless WebGPU node
+(`docs/WEBGPU-WIRELESS.md`, regression `scripts/test_bridge_loopback.py`).
 Built with a lot of help from Claude Opus 5.5.
 
 MIT license (llama.cpp keeps its own MIT license).

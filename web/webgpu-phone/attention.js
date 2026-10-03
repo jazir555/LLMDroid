@@ -18,6 +18,28 @@ import { NR, HD, f16ToF32, f32ToF16, mergePartial } from './phone-attn.js';
 
 const CHUNK = 4096; // keys per WebGPU dispatch (mirrors gpu_chunk tuning)
 
+// Byte-frozen pins from web/webgpu-phone/KERNELS.md (v1 branches as vendored).
+// Default is the moving `version: 1`; pass ?rev=pin (or per-kernel ?matmul_rev=/
+// ?softmax_rev= with a 40-char SHA) to freeze bytes, e.g. for benchmarks.
+export const KERNEL_PINS = {
+  matmul: 'b2b2761ada6793f50e5c8f17cc1dcbe811c6b95c',
+  softmax: '1986f903429837098d4e5f0f3ed01481c08c2180',
+};
+
+function kernelSelector(which, params) {
+  const per = params.get(`${which}_rev`);
+  if (per && /^[0-9a-f]{40}$/i.test(per)) return { revision: per };
+  if (params.get('rev') === 'pin') {
+    return { revision: KERNEL_PINS[which] };
+  }
+  return { version: 1 };
+}
+
+export function kernelSourceLabel(which, params) {
+  const sel = kernelSelector(which, params);
+  return sel.revision ? `rev ${sel.revision.slice(0, 8)}` : 'v1';
+}
+
 let _kernels = null; // { matmul, softmax } or { cpu: true }
 let _kernelError = '';
 
@@ -27,8 +49,9 @@ export function kernelStatus() {
   return 'WebGPU (matmul, softmax)';
 }
 
-export async function ensureKernels(log) {
+export async function ensureKernels(log, params) {
   if (_kernels) return _kernels;
+  params = params || new URLSearchParams(location.search);
   if (!('gpu' in navigator)) {
     _kernelError = 'no navigator.gpu';
     _kernels = { cpu: true };
@@ -36,10 +59,10 @@ export async function ensureKernels(log) {
     return _kernels;
   }
   try {
-    const matmul = await getKernel('webgpu-kernels/ai.onnx.MatMul', { version: 1 });
-    const softmax = await getKernel('webgpu-kernels/ai.onnx.Softmax', { version: 1 });
+    const matmul = await getKernel('webgpu-kernels/ai.onnx.MatMul', kernelSelector('matmul', params));
+    const softmax = await getKernel('webgpu-kernels/ai.onnx.Softmax', kernelSelector('softmax', params));
     _kernels = { matmul, softmax };
-    log && log('kernels loaded: ai.onnx.MatMul v1, ai.onnx.Softmax v1');
+    log && log(`kernels loaded: MatMul ${kernelSourceLabel('matmul', params)}, Softmax ${kernelSourceLabel('softmax', params)}`);
   } catch (e) {
     _kernelError = String((e && e.message) || e);
     _kernels = { cpu: true };

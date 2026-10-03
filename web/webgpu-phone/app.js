@@ -20,11 +20,32 @@ export function log(s) {
   el.textContent = (line + '\n' + el.textContent).slice(0, 8000);
 }
 
-const store = new KVStore(8192); // keys/layer cap; ERR beyond (jetsam-guard analog)
+// ?cap=N overrides the keys/layer cap (default 8192, clamp 1024..65536).
+// f16 store ~= nkv*512B/key/layer, so size the tab before serve sizes CTX_TOTAL.
+function kvCap() {
+  const raw = parseInt(new URLSearchParams(location.search).get('cap') || '', 10);
+  if (Number.isFinite(raw)) return Math.min(65536, Math.max(1024, raw));
+  return 8192;
+}
+
+const store = new KVStore(kvCap());
 const stats = { calls: 0, lastMs: 0, gpuMs: 0, startMs: 0 };
 let ws = null;
 let rxBuf = new Uint8Array(0);
 let macPhase = '';
+let wakeLock = null;
+
+async function holdWakeLock() {
+  // Screen Wake Lock keeps the tab's GPU timers alive while held keys exist;
+  // without it a backgrounded tab stalls ATTN and the host drops to Mac-only.
+  if (!('wakeLock' in navigator)) return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (_) {
+    wakeLock = null; // denied: host-side 60 s fallback still covers us
+  }
+}
 
 function heldKeys() {
   return store.layers.length ? store.layers[0].n : 0;
@@ -168,8 +189,84 @@ function onData(chunk) {
   pump();
 }
 
+/* ---- single-flight per device: only the leader tab holds the bridge slot.
+ * Tabs coordinate over BroadcastChannel + a localStorage heartbeat lock, so
+ * opening the page twice on one machine no longer wedges the bridge with a
+ * 1013 retry storm. Standbys show their state and take over (with a host
+ * key re-send) if the leader goes stale. Cross-device contention (phone +
+ * PC) is still first-wins at the bridge — this only covers tabs on one device. */
+const TAB_ID = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random())).slice(0, 8);
+const LEADER_KEY = 'webgpu-phone-leader';
+const LEADER_TTL_MS = 6000;
+const leaderBus = ('BroadcastChannel' in window) ? new BroadcastChannel('webgpu-phone') : null;
+let isLeader = false;
+
+function readLock() {
+  try {
+    const raw = localStorage.getItem(LEADER_KEY);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    if (!o || typeof o.ts !== 'number') return null;
+    return o;
+  } catch (_) {
+    return null;
+  }
+}
+
+function claimLeadership() {
+  const lock = { id: TAB_ID, ts: Date.now() };
+  try {
+    localStorage.setItem(LEADER_KEY, JSON.stringify(lock));
+  } catch (_) {
+    return false;
+  }
+  // Re-read to lose races between tabs that loaded simultaneously: last
+  // writer wins, everyone else stands by.
+  const back = readLock();
+  if (!back || back.id !== TAB_ID) return false;
+  if (!isLeader) {
+    isLeader = true;
+    log('leader on this device — connecting');
+    leaderBus && leaderBus.postMessage({ type: 'leader', id: TAB_ID });
+  }
+  return true;
+}
+
+function heartbeatLeadership() {
+  if (!isLeader) return;
+  try {
+    localStorage.setItem(LEADER_KEY, JSON.stringify({ id: TAB_ID, ts: Date.now() }));
+  } catch (_) {}
+}
+
+function resignLeadership() {
+  if (!isLeader) return;
+  isLeader = false;
+  try {
+    const cur = readLock();
+    if (cur && cur.id === TAB_ID) localStorage.removeItem(LEADER_KEY);
+  } catch (_) {}
+  leaderBus && leaderBus.postMessage({ type: 'release', id: TAB_ID });
+  try { ws && ws.close(1000, 'resign'); } catch (_) {}
+}
+
+function standbyCheck() {
+  if (isLeader) { heartbeatLeadership(); return; }
+  const lock = readLock();
+  const stale = !lock || (Date.now() - lock.ts > LEADER_TTL_MS);
+  if (!stale) return;
+  // Leader gone (closed tab, crashed renderer): take over. The bridge
+  // challenge evicts its ghost socket if one lingers; the host re-sends
+  // CONFIG + keys to the fresh store, so answers stay exact.
+  if (claimLeadership()) {
+    log('takeover: previous leader stale, host will re-send keys');
+    connect();
+  }
+}
+
 async function connect() {
-  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+  if (!isLeader) return; // standbys never open the socket
+  if (ws && ws.readyState !== WebSocket.CLOSED) return; // OPEN/CONNECTING/CLOSING: busy
   const url = $('url').value.trim();
   const token = $('token').value.trim();
   if (!url) { log('enter the bridge ws:// URL first'); return; }
@@ -178,15 +275,21 @@ async function connect() {
   await ensureKernels(log);
   ws = new WebSocket(full);
   ws.binaryType = 'arraybuffer';
-  ws.onopen = () => { $('state').textContent = 'connected'; rxBuf = new Uint8Array(0); log('connected to ' + url); refresh(); };
+  ws.onopen = () => {
+    $('state').textContent = 'connected'; rxBuf = new Uint8Array(0);
+    log(`connected to ${url} (cap ${store.cap} keys/layer)`);
+    holdWakeLock();
+    refresh();
+  };
   // Binary frames are PATN messages; text frames are host notes ("mac PHASE...").
   ws.onmessage = (ev) => {
     if (typeof ev.data === 'string') { macNote(ev.data); return; }
     onData(new Uint8Array(ev.data));
   };
   ws.onclose = (ev) => {
-    $('state').textContent = `closed (${ev.code})`;
-    log(`closed (${ev.code}); reconnect in 3 s`);
+    const why = ev.code === 1013 ? ' (bridge held elsewhere — this tab stays standby)' : '';
+    $('state').textContent = isLeader ? `closed (${ev.code})` : 'standby';
+    log(`closed (${ev.code})${why}; reconnect in 3 s`);
     setTimeout(() => { if ($('auto').checked) connect(); }, 3000);
   };
   ws.onerror = () => { $('state').textContent = 'error'; };
@@ -204,7 +307,40 @@ function macNote(line) {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  $('connect').addEventListener('click', connect);
+  $('connect').addEventListener('click', () => { if (claimLeadership()) connect(); });
   setInterval(refresh, 1000);
-  log('enter ws://host:50063 ?token=… and Connect. Needs WebGPU (Chrome/Edge 113+, Safari 26+).');
+  setInterval(standbyCheck, 2000);
+  if (leaderBus) {
+    // A released slot is an instant takeover opportunity, no 6 s stale wait.
+    leaderBus.onmessage = (ev) => {
+      if (ev.data && ev.data.type === 'release') standbyCheck();
+    };
+  }
+  window.addEventListener('beforeunload', resignLeadership);
+  // A tab returning to visible gets its timers back: reconnect now instead of
+  // waiting out the 3 s backoff, and re-take the wake lock (it releases on hide).
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    holdWakeLock();
+    if (isLeader && $('auto').checked && (!ws || ws.readyState === WebSocket.CLOSED)) connect();
+  });
+  // Zero-config entry: visit ?ws=ws://host:port&token=SECRET&connect=1 and the
+  // leader tab fills the fields and connects by itself — nothing to type on
+  // the phone. Non-leaders stay standby even with connect=1.
+  const q = new URLSearchParams(location.search);
+  if (q.get('ws')) $('url').value = q.get('ws');
+  if (q.get('token')) $('token').value = q.get('token');
+  if (claimLeadership()) {
+    $('state').textContent = 'leader';
+    if (q.get('connect') === '1' && $('url').value) {
+      log('auto-connecting…');
+      connect();
+    } else {
+      log('enter ws://host:50063 ?token=… and Connect. Needs WebGPU (Chrome/Edge 113+, Safari 26+).');
+    }
+  } else {
+    $('state').textContent = 'standby (leader active on this device)';
+    log('standby: another tab on this device holds the bridge. Close it to take over, or just wait — this tab steps in if it goes stale.');
+  }
+  log(`KV cap ${store.cap} keys/layer (?cap=N to change); kernel pins ?rev=pin.`);
 });

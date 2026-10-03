@@ -123,7 +123,9 @@ wired number — capacity math then under-claims rather than over-claims.
    (TAIL 0 until the tail links; attention HELLO is the gate).
 3. `pa-tool test` equivalent against `127.0.0.1:50062` from a Mac loopback
    build to gate accuracy (`max|O-ref|/max|ref| < 5e-3`, same as `pa-tool.cpp`),
-   then `PA_BIG_TOK=256` for the ATTN_BIG path.
+   then `PA_BIG_TOK=256` for the ATTN_BIG path. Without hardware, run the
+   wireless pipe contract instead: `python3 scripts/test_bridge_loopback.py`
+   (bridge fallback ports, HELLO→ATTN_BIG sizes, 403, mem).
 4. Push the tail (`phone-tail-android.sh L40`), `LLAMA_SPLIT_TAIL=... serve.sh`,
    reproduce `bench/turn-bench.py --config phone`.
 5. Port `vulkan_engine.cc` (MSL -> GLSL), retune `L`/`PA_BIG_CFG`/`PA_GPU_MIN_KEYS`
