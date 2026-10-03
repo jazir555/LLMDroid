@@ -58,6 +58,8 @@
   <code>python -m http.server 8000 --directory web/webgpu-phone</code>. See
   <code>docs/WEBGPU-WIRELESS.md</code>.</p>
 </main>
-<script type="module" src="./app.js"></script>
+<!-- ?v= cache-bust: phones aggressively cache app.js (304s), which once
+     stranded a tester on a pre-election build. Bump on each JS change. -->
+<script type="module" src="./app.js?v=3"></script>
 </body>
 </html>
