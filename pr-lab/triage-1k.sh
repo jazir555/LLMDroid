@@ -14,10 +14,10 @@ if [ -z "${GH_TOKEN:-}" ] && [ -z "${GITHUB_TOKEN:-}" ]; then
 fi
 
 echo "== stage 1+2: triage 1000 open PRs, detail top 200 =="
-python3 -u pr-lab/fetch_prs.py --limit 1000 --top 200 --out candidates-1k.json
+python3 -u fetch_prs.py --limit 1000 --top 200 --out candidates-1k.json
 
 echo "== merge loop: 20-PR batches until candidates exhausted =="
-python3 -u pr-lab/merge_lab.py \
+python3 -u merge_lab.py \
   --candidates candidates-1k.json \
   --repo ~/llama-pr-lab/llama.cpp \
   --state-dir ~/llama-pr-lab/state \
